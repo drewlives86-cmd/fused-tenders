@@ -52,17 +52,56 @@ def get(url, params, session):
     raise RuntimeError("too many retries: " + url)
 
 
-def walk(base, params, session, max_pages=80):
-    url = base
+def next_link(data):
+    links = data.get("links")
+    if isinstance(links, dict):
+        for k in ("next", "nextPage"):
+            if links.get(k):
+                return links[k]
+    if isinstance(links, list):
+        for l in links:
+            if isinstance(l, dict) and l.get("rel") == "next" and l.get("href"):
+                return l["href"]
+    for k in ("next", "nextLink", "next_page"):
+        if isinstance(data.get(k), str) and data[k]:
+            return data[k]
+    return None
+
+
+def walk(base, params, session, max_pages=60):
+    """Return (releases, followed_cursor). followed_cursor=True means the API told us about more pages."""
+    url, out, followed = base, [], False
     for _ in range(max_pages):
         data = get(url, params, session)
-        yield from data.get("releases", [])
-        links = data.get("links")
-        nxt = links.get("next") if isinstance(links, dict) else None
+        out.extend(data.get("releases", []))
+        nxt = next_link(data)
         if not nxt:
-            return
+            return out, followed
+        followed = True
         url, params = nxt, None
-        time.sleep(1)
+        time.sleep(0.5)
+    return out, followed
+
+
+SPLIT_AT = 8      # a window returning this many releases with no cursor is assumed truncated
+STATS = {"splits": 0, "calls": 0}
+
+
+def fetch_window(base, pf, pt, stage, start, end, session, deadline):
+    """Fetch all releases in [start, end]; if the API seems to truncate, halve the window and retry."""
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    params = {pf: start.strftime(fmt), pt: end.strftime(fmt), "stages": stage, "limit": 100}
+    STATS["calls"] += 1
+    rels, followed = walk(base, params, session)
+    span = (end - start).total_seconds()
+    if not followed and len(rels) >= SPLIT_AT and span > 120 and time.time() < deadline:
+        STATS["splits"] += 1
+        mid = start + (end - start) / 2
+        yield from fetch_window(base, pf, pt, stage, start, mid, session, deadline)
+        yield from fetch_window(base, pf, pt, stage, mid, end, session, deadline)
+        return
+    time.sleep(0.3)
+    yield from rels
 
 
 def parse_dt(s):
@@ -91,7 +130,8 @@ def score(rel, portal, now):
 
     kw, ev = 0, []
     tl = title.lower()
-    body = "\n".join(parts[1:]).lower()[:2500]
+    lot_titles = " | ".join((l.get("title") or "") for l in (t.get("lots") or [])).lower()
+    body = "\n".join(parts[1:]).lower()[:8000]
     # skip notices that are clearly something else (training courses, property leases, software)
     if any(x in tl for x in ("trainer", "training", "lease", "units ", "back office", "software", "licence", "licensing")):
         return None
@@ -99,9 +139,11 @@ def score(rel, portal, now):
         for k in lst:
             if k in tl:
                 kw = max(kw, pts); ev.append(k + " (in title)")
+            elif k in lot_titles:
+                kw = max(kw, pts); ev.append(k + " (in lot title)")
             elif k in body:
                 kw = max(kw, int(pts * 0.55)); ev.append(k + " (in description)")
-    for blob, full in ((tl, 26), (body, 15)):
+    for blob, full in ((tl + " " + lot_titles, 26), (body, 15)):
         if any(w in blob for w in EV_WORDS) and any(w in blob for w in EV_ACTIONS):
             kw = max(kw, full); ev.append("EV charge point inspection/maintenance")
             break
@@ -144,7 +186,7 @@ def score(rel, portal, now):
     total = min(100, kw + vpts + (20 if tag == "planning" else 16) + spts + dl_pts)
     prio = "P1" if total >= 80 else "P2" if total >= 60 else "P3" if total >= 40 else "Watch"
     if stale and prio == "P1": prio = "P2"
-    if not any("(in title)" in e or e.startswith("EV charge") and kw >= 26 for e in ev) and prio in ("P1", "P2"):
+    if not any("(in title)" in e or "(in lot title)" in e or e.startswith("EV charge") and kw >= 26 for e in ev) and prio in ("P1", "P2"):
         prio = "P3"
 
     if portal == "Contracts Finder":
@@ -188,7 +230,7 @@ def render(rows, stats, updated, diag=None):
         wl = "".join(f"<li><b>{E(w['buyer'])}</b> - {E(w['title'])} [{E(w['stage'])}, {E(w['date'][:10])}] "
                      f"<a href=\"{E(w['url'])}\" target=\"_blank\">notice</a></li>" for w in diag["watch"][:80]) or "<li>None of the watched buyers appeared in the feeds.</li>"
         diag_html = (f"<details style='margin-top:24px'><summary><b>Diagnostics</b> (for checking coverage)</summary>"
-                     f"<p>Failed date windows: {diag['failed']}</p><ul>{cnt}</ul>"
+                     f"<p>Failed date windows: {diag['failed']} &middot; API calls: {diag['calls']} &middot; window splits: {diag['splits']}</p><ul>{cnt}</ul>"
                      f"<p><b>Watched buyers - every notice found, matched or not:</b></p><ul>{wl}</ul></details>")
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FUSED Tender Intelligence</title><style>
@@ -224,6 +266,7 @@ def run(days, outdir):
     s = requests.Session()
     best, seen_ids, scanned, ok = {}, set(), 0, 0
     counts, failed, watch = {}, 0, []
+    deadline = time.time() + 4.5 * 3600   # stop splitting if the run gets too long
     for stage in ("planning", "tender"):
         for portal, base, pf, pt in (("Contracts Finder", CF_BASE, "publishedFrom", "publishedTo"),
                                      ("Find a Tender", FTS_BASE, "updatedFrom", "updatedTo")):
@@ -231,11 +274,9 @@ def run(days, outdir):
             n = 0
             start = now - timedelta(days=days)
             while start < now:
-                end = min(start + timedelta(days=3), now)
-                p = {pf: start.strftime("%Y-%m-%dT%H:%M:%S"), pt: end.strftime("%Y-%m-%dT%H:%M:%S"),
-                     "stages": stage, "limit": 100}
+                end = min(start + timedelta(days=1), now)
                 try:
-                    for rel in walk(base, p, s):
+                    for rel in fetch_window(base, pf, pt, stage, start, end, s, deadline):
                         rid = (rel.get("ocid"), rel.get("id"))
                         if rid in seen_ids: continue
                         seen_ids.add(rid); n += 1
@@ -269,7 +310,7 @@ def run(days, outdir):
                  scanned=scanned)
     os.makedirs(outdir, exist_ok=True)
     updated = now.strftime("%d %b %Y %H:%M UTC")
-    open(os.path.join(outdir, "index.html"), "w", encoding="utf-8").write(render(rows, stats, updated, dict(counts=counts, failed=failed, watch=sorted(watch, key=lambda w: w["date"], reverse=True))))
+    open(os.path.join(outdir, "index.html"), "w", encoding="utf-8").write(render(rows, stats, updated, dict(counts=counts, failed=failed, calls=STATS["calls"], splits=STATS["splits"], watch=sorted(watch, key=lambda w: w["date"], reverse=True))))
     json.dump(dict(updated=updated, stats=stats, rows=rows), open(os.path.join(outdir, "data.json"), "w"), indent=1)
     with open(os.path.join(outdir, "opportunities.csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) if rows else ["priority"])
