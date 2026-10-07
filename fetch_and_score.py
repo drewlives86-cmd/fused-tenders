@@ -32,6 +32,8 @@ EV_ACTIONS = ["inspect", "testing", "periodic", "maintenance", "compliance", "ce
 # CPV codes only add confidence to a keyword match; they never trigger a match alone.
 CPV_HIGH = {"71631000", "71630000"}
 CPV_MED = {"50711000", "71314100", "45310000"}
+WATCH = ["london and quadrant", "london & quadrant", "mid and south essex", "gloucestershire county",
+         "rochdale boroughwide", "kirklees"]
 SECTOR = {"council": 15, "borough": 15, "county": 15, "city of": 15, "nhs": 15, "hospital": 15,
           "health board": 15, "housing": 14, "homes": 12, "trust": 12, "academy": 13, "school": 13,
           "college": 13, "university": 13, "fire and rescue": 12, "police": 10, "ministry of defence": 9}
@@ -165,7 +167,7 @@ def score(rel, portal, now):
                 url=url, ocid=rel.get("ocid"), released=rel.get("date", ""))
 
 
-def render(rows, stats, updated):
+def render(rows, stats, updated, diag=None):
     E = html.escape
     def money(v): return f"£{v:,.0f}" if v else "not stated"
     cards = []
@@ -180,6 +182,14 @@ def render(rows, stats, updated):
 {f'<div class="ev"><b>Buyer contact:</b> {E(r["contact"])}</div>' if r['contact'] else ''}
 <div class="src"><a href="{E(r['url'])}" target="_blank" rel="noopener">Open source notice &#8599;</a></div></div>""")
     body = "\n".join(cards) or '<p>No matching opportunities in this window.</p>'
+    diag_html = ""
+    if diag:
+        cnt = "".join(f"<li>{E(k)}: {v} notices</li>" for k, v in diag["counts"].items())
+        wl = "".join(f"<li><b>{E(w['buyer'])}</b> - {E(w['title'])} [{E(w['stage'])}, {E(w['date'][:10])}] "
+                     f"<a href=\"{E(w['url'])}\" target=\"_blank\">notice</a></li>" for w in diag["watch"][:80]) or "<li>None of the watched buyers appeared in the feeds.</li>"
+        diag_html = (f"<details style='margin-top:24px'><summary><b>Diagnostics</b> (for checking coverage)</summary>"
+                     f"<p>Failed date windows: {diag['failed']}</p><ul>{cnt}</ul>"
+                     f"<p><b>Watched buyers - every notice found, matched or not:</b></p><ul>{wl}</ul></details>")
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FUSED Tender Intelligence</title><style>
 :root{{--navy:#0f2540;--accent:#e8622c;--bg:#f4f6f8;--b:#dfe4ea;--m:#5c6b7a}}
@@ -203,7 +213,7 @@ header{{background:linear-gradient(135deg,#0f2540,#16324f);color:#fff;padding:26
 <div class="stat"><div class="n">{stats['scanned']}</div><div class="l">Notices scanned</div></div></div>
 <div class="filters"><button class="on" data-f="all">All</button><button data-f="P1">P1</button><button data-f="P2">P2</button><button data-f="tender">Live tenders</button><button data-f="planning">Pre-market</button> <a href="opportunities.csv" style="font-size:13px;margin-left:10px">Download CSV</a></div>
 <div id="cards">{body}</div>
-<div class="foot">Score (0-100) = service match (30) + value (20) + stage, pre-market scores higher (20) + buyer sector fit (15) + deadline urgency (15). Both source APIs filter only by stage and date, so every notice is scanned and matched locally. Always check the source notice before acting.</div></div>
+{diag_html}<div class="foot">Score (0-100) = service match (30) + value (20) + stage, pre-market scores higher (20) + buyer sector fit (15) + deadline urgency (15). Both source APIs filter only by stage and date, so every notice is scanned and matched locally. Always check the source notice before acting.</div></div>
 <script>document.querySelectorAll('.filters button').forEach(b=>b.onclick=()=>{{document.querySelectorAll('.filters button').forEach(x=>x.classList.remove('on'));b.classList.add('on');const f=b.dataset.f;document.querySelectorAll('.card').forEach(c=>{{c.style.display=(f==='all'||c.dataset.p===f||c.dataset.s===f)?'':'none'}})}});</script>
 </body></html>"""
 
@@ -213,6 +223,7 @@ def run(days, outdir):
     now = datetime.now(timezone.utc)
     s = requests.Session()
     best, seen_ids, scanned, ok = {}, set(), 0, 0
+    counts, failed, watch = {}, 0, []
     for stage in ("planning", "tender"):
         for portal, base, pf, pt in (("Contracts Finder", CF_BASE, "publishedFrom", "publishedTo"),
                                      ("Find a Tender", FTS_BASE, "updatedFrom", "updatedTo")):
@@ -228,6 +239,13 @@ def run(days, outdir):
                         rid = (rel.get("ocid"), rel.get("id"))
                         if rid in seen_ids: continue
                         seen_ids.add(rid); n += 1
+                        bname = ((rel.get("buyer") or {}).get("name") or "")
+                        if any(w in bname.lower() for w in WATCH):
+                            wt = rel.get("tender") or {}
+                            wurl = (f"https://www.find-tender.service.gov.uk/Notice/{rel.get('id')}" if portal == "Find a Tender"
+                                    else next((d.get("url", "") for d in wt.get("documents", []) or []), ""))
+                            watch.append(dict(buyer=bname, title=wt.get("title", ""), stage="/".join(rel.get("tag") or []),
+                                              date=rel.get("date", ""), url=wurl))
                         r = score(rel, portal, now)
                         if not r: continue
                         key = r["ocid"]
@@ -236,9 +254,11 @@ def run(days, outdir):
                             best[key] = (rank, r)
                     ok += 1
                 except Exception as e:
+                    failed += 1
                     print(f"  window {start.date()} FAILED: {e}", file=sys.stderr)
                 start = end
             scanned += n
+            counts[f"{portal} / {stage}"] = n
             print(f"  {n} notices", file=sys.stderr)
     rows = [v[1] for v in best.values()]
     if ok == 0 or scanned == 0:
@@ -249,7 +269,7 @@ def run(days, outdir):
                  scanned=scanned)
     os.makedirs(outdir, exist_ok=True)
     updated = now.strftime("%d %b %Y %H:%M UTC")
-    open(os.path.join(outdir, "index.html"), "w", encoding="utf-8").write(render(rows, stats, updated))
+    open(os.path.join(outdir, "index.html"), "w", encoding="utf-8").write(render(rows, stats, updated, dict(counts=counts, failed=failed, watch=sorted(watch, key=lambda w: w["date"], reverse=True))))
     json.dump(dict(updated=updated, stats=stats, rows=rows), open(os.path.join(outdir, "data.json"), "w"), indent=1)
     with open(os.path.join(outdir, "opportunities.csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) if rows else ["priority"])
