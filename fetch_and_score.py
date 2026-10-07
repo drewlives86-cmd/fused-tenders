@@ -28,7 +28,7 @@ KW_MED = ["electrical compliance", "electrical safety", "electrical testing", "e
           "thermal imaging", "electrical remedial", "electrical statutory"]
 KW_LOW = []
 EV_WORDS = ["ev charg", "electric vehicle charg", "charge point", "chargepoint", "charging point", "ev infrastructure"]
-EV_ACTIONS = ["inspect", "test", "maintenance", "servic", "compliance", "certif"]
+EV_ACTIONS = ["inspect", "testing", "periodic", "maintenance", "compliance", "certif"]
 # CPV codes only add confidence to a keyword match; they never trigger a match alone.
 CPV_HIGH = {"71631000", "71630000"}
 CPV_MED = {"50711000", "71314100", "45310000"}
@@ -88,20 +88,33 @@ def score(rel, portal, now):
                 cpvs.append((ac["id"], ac.get("description", "")))
 
     kw, ev = 0, []
+    tl = title.lower()
+    body = "\n".join(parts[1:]).lower()[:2500]
+    # skip notices that are clearly something else (training courses, property leases, software)
+    if any(x in tl for x in ("trainer", "training", "lease", "units ", "back office", "software", "licence", "licensing")):
+        return None
     for lst, pts in ((KW_HIGH, 30), (KW_MED, 22)):
         for k in lst:
-            if k in text:
-                kw = max(kw, pts); ev.append(k)
-    if any(w in text for w in EV_WORDS) and any(w in text for w in EV_ACTIONS):
-        kw = max(kw, 26); ev.append("EV charge point inspection/maintenance")
+            if k in tl:
+                kw = max(kw, pts); ev.append(k + " (in title)")
+            elif k in body:
+                kw = max(kw, int(pts * 0.55)); ev.append(k + " (in description)")
+    for blob, full in ((tl, 26), (body, 15)):
+        if any(w in blob for w in EV_WORDS) and any(w in blob for w in EV_ACTIONS):
+            kw = max(kw, full); ev.append("EV charge point inspection/maintenance")
+            break
     if kw == 0:
         return None
     for code, d in cpvs:
         if code in CPV_HIGH or code in CPV_MED:
             ev.append(f"CPV {code} {d}"); kw = min(30, kw + 2)
 
-    tag = (rel.get("tag") or ["tender"])[0]
-    if tag not in ("planning", "tender"):
+    tags = rel.get("tag") or ["tender"]
+    if "tender" in tags or "tenderUpdate" in tags:
+        tag = "tender"
+    elif "planning" in tags or "planningUpdate" in tags:
+        tag = "planning"
+    else:
         return None
 
     # deadline / staleness
@@ -129,6 +142,8 @@ def score(rel, portal, now):
     total = min(100, kw + vpts + (20 if tag == "planning" else 16) + spts + dl_pts)
     prio = "P1" if total >= 80 else "P2" if total >= 60 else "P3" if total >= 40 else "Watch"
     if stale and prio == "P1": prio = "P2"
+    if not any("(in title)" in e or e.startswith("EV charge") and kw >= 26 for e in ev) and prio in ("P1", "P2"):
+        prio = "P3"
 
     if portal == "Contracts Finder":
         url = next((d.get("url") for d in t.get("documents", []) or [] if d.get("documentType") in ("tenderNotice",) or "Notice" in (d.get("description") or "")), "")
@@ -147,7 +162,7 @@ def score(rel, portal, now):
     return dict(priority=prio, fit_score=total, buyer=buyer, stage=tag, status=status, stale=stale,
                 title=title, value_gbp=val, deadline=dl.date().isoformat() if dl else "",
                 evidence="; ".join(dict.fromkeys(ev))[:300], contact=contact, portal=portal,
-                url=url, ocid=rel.get("ocid"))
+                url=url, ocid=rel.get("ocid"), released=rel.get("date", ""))
 
 
 def render(rows, stats, updated):
@@ -194,36 +209,38 @@ header{{background:linear-gradient(135deg,#0f2540,#16324f);color:#fff;padding:26
 
 
 def run(days, outdir):
+    days = max(days, 150)   # open tenders can be months old; closed ones are dropped locally
     now = datetime.now(timezone.utc)
-    f = (now - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00")
-    t = now.strftime("%Y-%m-%dT23:59:59")
     s = requests.Session()
-    rows, seen, scanned, ok = [], set(), 0, 0
+    best, seen_ids, scanned, ok = {}, set(), 0, 0
     for stage in ("planning", "tender"):
         for portal, base, pf, pt in (("Contracts Finder", CF_BASE, "publishedFrom", "publishedTo"),
                                      ("Find a Tender", FTS_BASE, "updatedFrom", "updatedTo")):
             print(f"{portal} / {stage}", file=sys.stderr)
             n = 0
-            # query in 2-day windows so API result caps can't hide older notices
             start = now - timedelta(days=days)
             while start < now:
-                end = min(start + timedelta(days=2), now)
+                end = min(start + timedelta(days=3), now)
                 p = {pf: start.strftime("%Y-%m-%dT%H:%M:%S"), pt: end.strftime("%Y-%m-%dT%H:%M:%S"),
                      "stages": stage, "limit": 100}
                 try:
                     for rel in walk(base, p, s):
-                        n += 1
-                        oc = rel.get("ocid")
-                        if oc in seen: continue
-                        seen.add(oc)
+                        rid = (rel.get("ocid"), rel.get("id"))
+                        if rid in seen_ids: continue
+                        seen_ids.add(rid); n += 1
                         r = score(rel, portal, now)
-                        if r: rows.append(r)
+                        if not r: continue
+                        key = r["ocid"]
+                        rank = (r["stage"] == "tender", r["released"])
+                        if key not in best or rank > best[key][0]:
+                            best[key] = (rank, r)
                     ok += 1
                 except Exception as e:
                     print(f"  window {start.date()} FAILED: {e}", file=sys.stderr)
                 start = end
             scanned += n
             print(f"  {n} notices", file=sys.stderr)
+    rows = [v[1] for v in best.values()]
     if ok == 0 or scanned == 0:
         sys.exit("No data retrieved - leaving previous site untouched.")
     rows.sort(key=lambda r: (r["stale"], -r["fit_score"]))
