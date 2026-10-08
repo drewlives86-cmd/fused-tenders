@@ -24,8 +24,8 @@ KW_HIGH = ["eicr", "electrical installation condition report", "electrical condi
            "emergency lighting", "emergency light"]
 KW_MED = ["electrical compliance", "electrical safety", "electrical testing", "electrical inspection",
           "periodic inspection and testing", "periodic electrical", "statutory electrical",
-          "electrical certification", "rcd testing", "bs 7671", "bs7671", "thermographic",
-          "thermal imaging", "electrical remedial", "electrical statutory"]
+          "electrical certification", "rcd testing", "bs 7671", "bs7671",
+          "electrical remedial", "electrical statutory"]
 KW_LOW = []
 EV_WORDS = ["ev charg", "electric vehicle charg", "charge point", "chargepoint", "charging point", "ev infrastructure"]
 EV_ACTIONS = ["inspect", "testing", "periodic", "maintenance", "compliance", "certif"]
@@ -34,6 +34,8 @@ CPV_HIGH = {"71631000", "71630000"}
 CPV_MED = {"50711000", "71314100", "45310000"}
 WATCH = ["london and quadrant", "london & quadrant", "mid and south essex", "gloucestershire county",
          "rochdale boroughwide", "kirklees"]
+KNOWN = ["085363-2026", "089933-2026", "089937-2026", "090449-2026", "091974-2026", "094380-2026",
+         "ocds-h6vhtk-069fbf"]   # notices you told us about: always fetched directly and reported in Diagnostics
 SECTOR = {"council": 15, "borough": 15, "county": 15, "city of": 15, "nhs": 15, "hospital": 15,
           "health board": 15, "housing": 14, "homes": 12, "trust": 12, "academy": 13, "school": 13,
           "college": 13, "university": 13, "fire and rescue": 12, "police": 10, "ministry of defence": 9}
@@ -68,40 +70,31 @@ def next_link(data):
     return None
 
 
-def walk(base, params, session, max_pages=60):
-    """Return (releases, followed_cursor). followed_cursor=True means the API told us about more pages."""
-    url, out, followed = base, [], False
-    for _ in range(max_pages):
+def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None, info=None):
+    """Walk the API's own paging links from newest to oldest until releases are older than cutoff."""
+    url, params, pages = base, first_params, 0
+    while pages < max_pages and (deadline is None or time.time() < deadline):
         data = get(url, params, session)
-        out.extend(data.get("releases", []))
+        rels = data.get("releases", [])
+        pages += 1
+        if info is not None:
+            info["pages"] = info.get("pages", 0) + 1
+            for r in rels:
+                for tg in (r.get("tag") or ["?"]):
+                    info.setdefault("tags", {})
+                    info["tags"][tg] = info["tags"].get(tg, 0) + 1
+                d = r.get("date", "")
+                if d and (not info.get("oldest") or d < info["oldest"]):
+                    info["oldest"] = d
+        yield from rels
         nxt = next_link(data)
-        if not nxt:
-            return out, followed
-        followed = True
+        if not nxt or not rels:
+            return
+        dates = [r.get("date", "") for r in rels if r.get("date")]
+        if dates and max(dates)[:10] < cutoff.strftime("%Y-%m-%d"):
+            return                       # whole page older than the look-back
         url, params = nxt, None
-        time.sleep(0.5)
-    return out, followed
-
-
-SPLIT_AT = 8      # a window returning this many releases with no cursor is assumed truncated
-STATS = {"splits": 0, "calls": 0}
-
-
-def fetch_window(base, pf, pt, stage, start, end, session, deadline):
-    """Fetch all releases in [start, end]; if the API seems to truncate, halve the window and retry."""
-    fmt = "%Y-%m-%dT%H:%M:%S"
-    params = {pf: start.strftime(fmt), pt: end.strftime(fmt), "stages": stage, "limit": 100}
-    STATS["calls"] += 1
-    rels, followed = walk(base, params, session)
-    span = (end - start).total_seconds()
-    if not followed and len(rels) >= SPLIT_AT and span > 120 and time.time() < deadline:
-        STATS["splits"] += 1
-        mid = start + (end - start) / 2
-        yield from fetch_window(base, pf, pt, stage, start, mid, session, deadline)
-        yield from fetch_window(base, pf, pt, stage, mid, end, session, deadline)
-        return
-    time.sleep(0.3)
-    yield from rels
+        time.sleep(0.4)
 
 
 def parse_dt(s):
@@ -133,7 +126,7 @@ def score(rel, portal, now):
     lot_titles = " | ".join((l.get("title") or "") for l in (t.get("lots") or [])).lower()
     body = "\n".join(parts[1:]).lower()[:8000]
     # skip notices that are clearly something else (training courses, property leases, software)
-    if any(x in tl for x in ("trainer", "training", "lease", "units ", "back office", "software", "licence", "licensing")):
+    if any(x in tl for x in ("trainer", "training", "lease", "units ", "back office", "software", "licence", "licensing", "consultancy", "calibration")):
         return None
     for lst, pts in ((KW_HIGH, 30), (KW_MED, 22)):
         for k in lst:
@@ -226,11 +219,15 @@ def render(rows, stats, updated, diag=None):
     body = "\n".join(cards) or '<p>No matching opportunities in this window.</p>'
     diag_html = ""
     if diag:
-        cnt = "".join(f"<li>{E(k)}: {v} notices</li>" for k, v in diag["counts"].items())
+        cnt = "".join(f"<li>{E(k)}: {v} releases scanned</li>" for k, v in diag["counts"].items())
         wl = "".join(f"<li><b>{E(w['buyer'])}</b> - {E(w['title'])} [{E(w['stage'])}, {E(w['date'][:10])}] "
                      f"<a href=\"{E(w['url'])}\" target=\"_blank\">notice</a></li>" for w in diag["watch"][:80]) or "<li>None of the watched buyers appeared in the feeds.</li>"
+        info_html = "".join(f"<li>{E(k)}: {v.get('pages', 0)} pages, oldest release {E(str(v.get('oldest', ''))[:10])}, tags {E(str(v.get('tags', {})))}</li>" for k, v in diag["infos"].items())
+        known_html = "".join(f"<li>{E(k['id'])} - {E(k['title'])} [{E(k['tags'])}] - {E(k['result'])}</li>" for k in diag["known"]) or "<li>none</li>"
         diag_html = (f"<details style='margin-top:24px'><summary><b>Diagnostics</b> (for checking coverage)</summary>"
-                     f"<p>Failed date windows: {diag['failed']} &middot; API calls: {diag['calls']} &middot; window splits: {diag['splits']}</p><ul>{cnt}</ul>"
+                     f"<p>Failed feeds: {diag['failed']}</p><ul>{cnt}</ul>"
+                     f"<p><b>Feed details:</b></p><ul>{info_html}</ul>"
+                     f"<p><b>Notices you named, fetched directly:</b></p><ul>{known_html}</ul>"
                      f"<p><b>Watched buyers - every notice found, matched or not:</b></p><ul>{wl}</ul></details>")
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>FUSED Tender Intelligence</title><style>
@@ -263,44 +260,62 @@ header{{background:linear-gradient(135deg,#0f2540,#16324f);color:#fff;padding:26
 def run(days, outdir):
     days = max(days, 150)   # open tenders can be months old; closed ones are dropped locally
     now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
     s = requests.Session()
     best, seen_ids, scanned, ok = {}, set(), 0, 0
-    counts, failed, watch = {}, 0, []
-    deadline = time.time() + 4.5 * 3600   # stop splitting if the run gets too long
-    for stage in ("planning", "tender"):
-        for portal, base, pf, pt in (("Contracts Finder", CF_BASE, "publishedFrom", "publishedTo"),
-                                     ("Find a Tender", FTS_BASE, "updatedFrom", "updatedTo")):
-            print(f"{portal} / {stage}", file=sys.stderr)
-            n = 0
-            start = now - timedelta(days=days)
-            while start < now:
-                end = min(start + timedelta(days=1), now)
-                try:
-                    for rel in fetch_window(base, pf, pt, stage, start, end, s, deadline):
-                        rid = (rel.get("ocid"), rel.get("id"))
-                        if rid in seen_ids: continue
-                        seen_ids.add(rid); n += 1
-                        bname = ((rel.get("buyer") or {}).get("name") or "")
-                        if any(w in bname.lower() for w in WATCH):
-                            wt = rel.get("tender") or {}
-                            wurl = (f"https://www.find-tender.service.gov.uk/Notice/{rel.get('id')}" if portal == "Find a Tender"
-                                    else next((d.get("url", "") for d in wt.get("documents", []) or []), ""))
-                            watch.append(dict(buyer=bname, title=wt.get("title", ""), stage="/".join(rel.get("tag") or []),
-                                              date=rel.get("date", ""), url=wurl))
-                        r = score(rel, portal, now)
-                        if not r: continue
-                        key = r["ocid"]
-                        rank = (r["stage"] == "tender", r["released"])
-                        if key not in best or rank > best[key][0]:
-                            best[key] = (rank, r)
-                    ok += 1
-                except Exception as e:
-                    failed += 1
-                    print(f"  window {start.date()} FAILED: {e}", file=sys.stderr)
-                start = end
-            scanned += n
-            counts[f"{portal} / {stage}"] = n
-            print(f"  {n} notices", file=sys.stderr)
+    counts, failed, watch, infos, known = {}, 0, [], {}, []
+    deadline = time.time() + 5 * 3600
+
+    def consider(rel, portal):
+        nonlocal scanned
+        rid = (rel.get("ocid"), rel.get("id"))
+        if rid in seen_ids: return None
+        seen_ids.add(rid); scanned += 1
+        bname = ((rel.get("buyer") or {}).get("name") or "")
+        if any(w in bname.lower() for w in WATCH):
+            wt = rel.get("tender") or {}
+            wurl = (f"https://www.find-tender.service.gov.uk/Notice/{rel.get('id')}" if portal == "Find a Tender"
+                    else next((d.get("url", "") for d in wt.get("documents", []) or []), ""))
+            watch.append(dict(buyer=bname, title=wt.get("title", ""), stage="/".join(rel.get("tag") or []),
+                              date=rel.get("date", ""), url=wurl))
+        r = score(rel, portal, now)
+        if r:
+            key = r["ocid"]
+            rank = (r["stage"] == "tender", r["released"])
+            if key not in best or rank > best[key][0]:
+                best[key] = (rank, r)
+        return r
+
+    feeds = (("Find a Tender", FTS_BASE, {"limit": 100}),
+             ("Contracts Finder", CF_BASE, {"publishedFrom": cutoff.strftime("%Y-%m-%dT00:00:00"),
+                                           "publishedTo": now.strftime("%Y-%m-%dT%H:%M:%S"), "limit": 100}))
+    for portal, base, params in feeds:
+        print(f"{portal}: walking feed", file=sys.stderr)
+        info = infos.setdefault(portal, {})
+        n0 = scanned
+        try:
+            for rel in walk_feed(base, params, s, cutoff, deadline=deadline, info=info):
+                consider(rel, portal)
+            ok += 1
+        except Exception as e:
+            failed += 1
+            print(f"  {portal} FAILED: {e}", file=sys.stderr)
+        counts[portal] = scanned - n0
+        print(f"  {scanned - n0} releases", file=sys.stderr)
+
+    # notices you named: fetch directly so they can never be missed by the feed walk
+    for nid in KNOWN:
+        try:
+            data = get(f"{FTS_BASE}/{nid}", None, s)
+            rels = data.get("releases", [])
+            for rel in rels:
+                consider(rel, "Find a Tender")
+            t0 = (rels[-1].get("tender") or {}) if rels else {}
+            matched = any(rel.get("ocid") in best for rel in rels)
+            known.append(dict(id=nid, title=t0.get("title", "(no title)"), tags="/".join(rels[0].get("tag") or []) if rels else "",
+                              result="matched - shown above" if matched else "fetched but not matched/closed by filters"))
+        except Exception as e:
+            known.append(dict(id=nid, title="", tags="", result=f"could not fetch: {str(e)[:80]}"))
     rows = [v[1] for v in best.values()]
     if ok == 0 or scanned == 0:
         sys.exit("No data retrieved - leaving previous site untouched.")
@@ -310,7 +325,7 @@ def run(days, outdir):
                  scanned=scanned)
     os.makedirs(outdir, exist_ok=True)
     updated = now.strftime("%d %b %Y %H:%M UTC")
-    open(os.path.join(outdir, "index.html"), "w", encoding="utf-8").write(render(rows, stats, updated, dict(counts=counts, failed=failed, calls=STATS["calls"], splits=STATS["splits"], watch=sorted(watch, key=lambda w: w["date"], reverse=True))))
+    open(os.path.join(outdir, "index.html"), "w", encoding="utf-8").write(render(rows, stats, updated, dict(counts=counts, failed=failed, infos=infos, known=known, watch=sorted(watch, key=lambda w: w["date"], reverse=True))))
     json.dump(dict(updated=updated, stats=stats, rows=rows), open(os.path.join(outdir, "data.json"), "w"), indent=1)
     with open(os.path.join(outdir, "opportunities.csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) if rows else ["priority"])
