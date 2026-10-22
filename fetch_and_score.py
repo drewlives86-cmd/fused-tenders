@@ -1,25 +1,25 @@
 """
 FUSED Tender Intelligence - daily fetch, score and publish.
-
+ 
 Pulls notices from Find a Tender and Contracts Finder (free, key-less OCDS APIs),
 keeps electrical-compliance matches, scores them 0-100 and writes:
   site/index.html        the dashboard (published to GitHub Pages)
   site/opportunities.csv CRM-ready export
   site/data.json         raw scored data
-
+ 
 Usage:  pip install requests ; python fetch_and_score.py --days 45
 """
 import argparse, csv, html, json, os, sys, time
 from datetime import datetime, timedelta, timezone
-
+ 
 import requests
-
+ 
 FTS_BASE = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
 CF_BASE = "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search"
 PCS_BASE = "https://api.publiccontractsscotland.gov.uk/v1/Notices"
 S2W_BASE = "https://api.sell2wales.gov.uk/v1/Notices"
 UA = {"Accept": "application/json", "User-Agent": "FUSED-Tender-Intelligence/1.0"}
-
+ 
 KW_HIGH = ["eicr", "electrical installation condition report", "electrical condition report",
            "fixed wire", "fixed wiring", "fixed electrical installation",
            "portable appliance", "pat testing", "pat test", "appliance testing",
@@ -41,8 +41,8 @@ KNOWN = ["085363-2026", "089933-2026", "089937-2026", "090449-2026", "091974-202
 SECTOR = {"council": 15, "borough": 15, "county": 15, "city of": 15, "nhs": 15, "hospital": 15,
           "health board": 15, "housing": 14, "homes": 12, "trust": 12, "academy": 13, "school": 13,
           "college": 13, "university": 13, "fire and rescue": 12, "police": 10, "ministry of defence": 9}
-
-
+ 
+ 
 def get(url, params, session):
     forbidden = 0
     for attempt in range(10):
@@ -64,8 +64,8 @@ def get(url, params, session):
             time.sleep(int(r.headers.get("Retry-After", 10)) + 5 * attempt); continue
         r.raise_for_status()
     raise RuntimeError("gave up after retries: " + url[:120])
-
-
+ 
+ 
 def next_link(data):
     links = data.get("links")
     if isinstance(links, dict):
@@ -80,8 +80,8 @@ def next_link(data):
         if isinstance(data.get(k), str) and data[k]:
             return data[k]
     return None
-
-
+ 
+ 
 def extract_releases(data):
     """PCS / Sell2Wales return notice lists in OCDS; accept a few possible shapes."""
     out = []
@@ -97,8 +97,8 @@ def extract_releases(data):
                 if k in data:
                     out.extend(extract_releases(data[k]))
     return out
-
-
+ 
+ 
 def month_list(n):
     d = datetime.now(timezone.utc).replace(day=1)
     out = []
@@ -106,8 +106,8 @@ def month_list(n):
         out.append(d.strftime("%m-%Y"))
         d = (d - timedelta(days=1)).replace(day=1)
     return out
-
-
+ 
+ 
 def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None, info=None):
     """Walk the API's own paging links from newest to oldest until releases are older than cutoff."""
     url, params, pages = base, first_params, 0
@@ -133,15 +133,16 @@ def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None
             return                       # whole page older than the look-back
         url, params = nxt, None
         time.sleep(0.4)
-
-
+ 
+ 
 def parse_dt(s):
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     except Exception:
         return None
-
-
+ 
+ 
 def score(rel, portal, now):
     t = rel.get("tender") or {}
     title = t.get("title") or ""
@@ -149,7 +150,7 @@ def score(rel, portal, now):
     for lot in t.get("lots", []) or []:
         parts += [lot.get("title") or "", lot.get("description") or ""]
     text = "\n".join(parts).lower()
-
+ 
     cpvs = []
     c = t.get("classification")
     if c and c.get("scheme") == "CPV":
@@ -158,7 +159,7 @@ def score(rel, portal, now):
         for ac in it.get("additionalClassifications", []) or []:
             if ac.get("scheme") == "CPV":
                 cpvs.append((ac["id"], ac.get("description", "")))
-
+ 
     kw, ev = 0, []
     tl = title.lower()
     lot_titles = " | ".join((l.get("title") or "") for l in (t.get("lots") or [])).lower()
@@ -183,7 +184,7 @@ def score(rel, portal, now):
     for code, d in cpvs:
         if code in CPV_HIGH or code in CPV_MED:
             ev.append(f"CPV {code} {d}"); kw = min(30, kw + 2)
-
+ 
     tags = rel.get("tag") or ["tender"]
     if "tender" in tags or "tenderUpdate" in tags:
         tag = "tender"
@@ -191,7 +192,7 @@ def score(rel, portal, now):
         tag = "planning"
     else:
         return None
-
+ 
     # deadline / staleness
     dl = parse_dt((t.get("tenderPeriod") or {}).get("endDate") or "")
     future = parse_dt((t.get("communication") or {}).get("futureNoticeDate") or "")
@@ -208,7 +209,7 @@ def score(rel, portal, now):
         status = "Pre-market / pipeline"
         if dl and dl < now: stale, status, dl_pts = True, "Pipeline - stated deadline has passed, verify", 2
         elif future and future < now: stale, status, dl_pts = True, "Pipeline - expected notice date has passed, verify", 2
-
+ 
     val = (t.get("value") or {}).get("amount")
     vpts = 8 if not val else 20 if val >= 1e6 else 16 if val >= 250e3 else 11 if val >= 50e3 else 6
     buyer = (rel.get("buyer") or {}).get("name", "")
@@ -219,27 +220,27 @@ def score(rel, portal, now):
     if stale and prio == "P1": prio = "P2"
     if not any("(in title)" in e or "(in lot title)" in e or e.startswith("EV charge") and kw >= 26 for e in ev) and prio in ("P1", "P2"):
         prio = "P3"
-
+ 
     if portal != "Find a Tender":
         url = next((d.get("url") for d in t.get("documents", []) or [] if d.get("documentType") in ("tenderNotice",) or "Notice" in (d.get("description") or "")), "")
         if not url:
             url = ((rel.get("planning") or {}).get("documents") or [{}])[0].get("url", "")
     else:
         url = f"https://www.find-tender.service.gov.uk/Notice/{rel.get('id')}"
-
+ 
     contact = ""
     for p in rel.get("parties", []) or []:
         if "buyer" in (p.get("roles") or []):
             cp = p.get("contactPoint") or {}
             contact = " / ".join(x for x in (cp.get("name"), cp.get("email"), cp.get("telephone")) if x)
             break
-
+ 
     return dict(priority=prio, fit_score=total, buyer=buyer, stage=tag, status=status, stale=stale,
                 title=title, value_gbp=val, deadline=dl.date().isoformat() if dl else "",
                 evidence="; ".join(dict.fromkeys(ev))[:300], contact=contact, portal=portal,
                 url=url, ocid=rel.get("ocid"), released=rel.get("date", ""))
-
-
+ 
+ 
 def render(rows, stats, updated, diag=None):
     E = html.escape
     def money(v): return f"£{v:,.0f}" if v else "not stated"
@@ -295,8 +296,8 @@ header{{background:linear-gradient(135deg,#0f2540,#16324f);color:#fff;padding:26
 {diag_html}<div class="foot">Score (0-100) = service match (30) + value (20) + stage, pre-market scores higher (20) + buyer sector fit (15) + deadline urgency (15). Both source APIs filter only by stage and date, so every notice is scanned and matched locally. Always check the source notice before acting.</div></div>
 <script>document.getElementById('q').oninput=e=>{{const v=e.target.value.toLowerCase();document.querySelectorAll('.card').forEach(c=>{{c.style.display=c.textContent.toLowerCase().includes(v)?'':'none'}})}};document.querySelectorAll('.filters button').forEach(b=>b.onclick=()=>{{document.querySelectorAll('.filters button').forEach(x=>x.classList.remove('on'));b.classList.add('on');const f=b.dataset.f;document.querySelectorAll('.card').forEach(c=>{{c.style.display=(f==='all'||c.dataset.p===f||c.dataset.s===f)?'':'none'}})}});</script>
 </body></html>"""
-
-
+ 
+ 
 def run(days, outdir):
     days = max(days, 150)   # open tenders can be months old; closed ones are dropped locally
     now = datetime.now(timezone.utc)
@@ -305,7 +306,7 @@ def run(days, outdir):
     best, seen_ids, scanned, ok = {}, set(), 0, 0
     counts, failed, watch, infos, known = {}, 0, [], {}, []
     deadline = time.time() + 5 * 3600
-
+ 
     def consider(rel, portal):
         nonlocal scanned
         rid = (rel.get("ocid"), rel.get("id"))
@@ -318,14 +319,23 @@ def run(days, outdir):
                     else next((d.get("url", "") for d in wt.get("documents", []) or []), ""))
             watch.append(dict(buyer=bname, title=wt.get("title", ""), stage="/".join(rel.get("tag") or []),
                               date=rel.get("date", ""), url=wurl))
-        r = score(rel, portal, now)
+        try:
+            r = score(rel, portal, now)
+        except Exception as e:
+            r = None
+            if len(errors) < 25: errors.append(f"score error on {rel.get('id')}: {e}")
+        wtxt = (bname + " " + ((rel.get("tender") or {}).get("title") or "")).lower()
+        if any(w in wtxt for w in ("swindon", "ca18576")) and not any(x.get("title") == (rel.get("tender") or {}).get("title") for x in watch):
+            wt = rel.get("tender") or {}
+            watch.append(dict(buyer=bname, title=wt.get("title", "") + (" [MATCHED]" if r else " [NOT MATCHED]"), stage="/".join(rel.get("tag") or []),
+                              date=rel.get("date", ""), url=next((d.get("url", "") for d in wt.get("documents", []) or []), "")))
         if r:
             key = r["ocid"]
             rank = (r["stage"] == "tender", r["released"])
             if key not in best or rank > best[key][0]:
                 best[key] = (rank, r)
         return r
-
+ 
     errors = []
     cf_common = {"publishedFrom": cutoff.strftime("%Y-%m-%dT00:00:00"),
                  "publishedTo": now.strftime("%Y-%m-%dT%H:%M:%S"), "limit": 100}
@@ -346,7 +356,7 @@ def run(days, outdir):
             print(f"  {label} FAILED: {e}", file=sys.stderr)
         counts[label] = scanned - n0
         print(f"  {scanned - n0} releases", file=sys.stderr)
-
+ 
     # Scotland and Wales portals (below-threshold notices are published only there)
     for label, base, portal in (("Public Contracts Scotland", PCS_BASE, "Public Contracts Scotland"),
                                 ("Sell2Wales", S2W_BASE, "Sell2Wales")):
@@ -365,7 +375,7 @@ def run(days, outdir):
                 time.sleep(0.5)
         counts[label] = scanned - n0
         print(f"  {label}: {scanned - n0} releases", file=sys.stderr)
-
+ 
     # notices you named: fetch directly so they can never be missed by the feed walk
     for nid in KNOWN:
         try:
@@ -394,8 +404,8 @@ def run(days, outdir):
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) if rows else ["priority"])
         w.writeheader(); w.writerows(rows)
     print(f"Done: {len(rows)} matches from {scanned} notices -> {outdir}", file=sys.stderr)
-
-
+ 
+ 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=45)
